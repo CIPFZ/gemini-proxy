@@ -109,6 +109,12 @@ pub fn get_token_path() -> PathBuf {
     home.join(".gemini-proxy").join("token.json")
 }
 
+/// Get PID file path: ~/.gemini-proxy/gemini-proxy.pid
+pub fn get_pid_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".gemini-proxy").join("gemini-proxy.pid")
+}
+
 fn expand_env_vars(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();

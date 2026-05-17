@@ -107,6 +107,9 @@ enum Commands {
         /// Bind address
         #[arg(short, long, default_value = "127.0.0.1:8045")]
         bind: String,
+        /// Run as daemon (background process)
+        #[arg(short, long)]
+        daemon: bool,
     },
     /// Login with Google OAuth
     Login {
@@ -128,10 +131,57 @@ enum Commands {
     Quota,
     /// Logout (clear stored token)
     Logout,
+    /// Stop the running daemon
+    Stop,
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Daemonize before tokio runtime starts (fork + setsid)
+    if let Some(Commands::Serve { daemon: true, .. }) = &cli.command {
+        daemonize();
+    }
+
+    tokio_main(cli)
+}
+
+fn daemonize() {
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        if pid > 0 {
+            std::process::exit(0);
+        }
+
+        libc::setsid();
+
+        // Redirect stdin/stdout/stderr to /dev/null
+        let devnull = libc::open(b"/dev/null\0" as *const u8 as *const libc::c_char, libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDIN_FILENO);
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+
+    // Write PID file (after fork, in child)
+    let child_pid = std::process::id();
+    let pid_path = config::get_pid_path();
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Err(e) = std::fs::write(&pid_path, child_pid.to_string()) {
+        eprintln!("Warning: failed to write PID file {}: {}", pid_path.display(), e);
+    }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     // Get log directory path
     let log_dir = config::get_default_config_path()
         .parent()
@@ -155,8 +205,6 @@ async fn main() -> anyhow::Result<()> {
         .with(EnvFilter::from_default_env().add_directive("gemini_proxy=info".parse()?))
         .init();
 
-    let cli = Cli::parse();
-
     // Load configuration
     let config_path = cli.config.as_ref()
         .map(|p| p.clone())
@@ -177,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Execute command
     match cli.command {
-        Some(Commands::Serve { bind }) => {
+        Some(Commands::Serve { bind, .. }) => {
             cmd_serve(&config, &bind).await?;
         }
         Some(Commands::Login { force, .. }) => {
@@ -191,6 +239,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Logout) => {
             cmd_logout().await?;
+        }
+        Some(Commands::Stop) => {
+            cmd_stop()?;
         }
         Some(Commands::Proxy { command }) => {
             cmd_proxy(&config, command)?;
@@ -228,13 +279,21 @@ async fn cmd_serve(config: &config::Config, bind: &str) -> anyhow::Result<()> {
     println!();
     println!("Usage Examples:");
     println!();
-    println!("# Chat completion");
-    println!("curl -X POST http://{}/v1/models/gemini-3-flash:generateContent \\", bind);
-    println!("     -H 'Content-Type: application/json' \\");
-    println!("     -d '{{\"contents\":[{{\"parts\":[{{\"text\":\"Hello\"}}]}}]}}'");
-    println!();
     println!("# List models");
     println!("curl http://{}/v1/models", bind);
+    println!();
+    println!("# Chat completion (non-streaming)");
+    println!("curl -X POST http://{}/v1/chat/completions \\", bind);
+    println!("     -H 'Content-Type: application/json' \\");
+    println!("     -d '{{\"model\":\"gemini-2.5-flash\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"stream\":false}}'");
+    println!();
+    println!("# Chat completion (streaming)");
+    println!("curl -X POST http://{}/v1/chat/completions \\", bind);
+    println!("     -H 'Content-Type: application/json' \\");
+    println!("     -d '{{\"model\":\"gemini-2.5-flash\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"stream\":true}}'");
+    println!();
+    println!("# Check quota");
+    println!("curl http://{}/v1/internal/quota", bind);
     println!();
 
     // Start server
@@ -340,11 +399,28 @@ async fn cmd_status() -> anyhow::Result<()> {
 
     let token = token_manager.get_token().await;
     if let Some(t) = token {
-        println!("\n✓ Logged in as: {}\n", t.email.as_deref().unwrap_or("N/A"));
-        println!("  Token expires in: {} seconds", t.expires_in);
-        println!("  Expiry timestamp: {}", t.expiry_timestamp);
+        let now = chrono::Local::now().timestamp();
+        let remaining = t.expiry_timestamp - now;
+        let expired = t.is_expired();
+
+        println!("\n  Logged in as: {}\n", t.email.as_deref().unwrap_or("N/A"));
+
+        if expired {
+            println!("  Token status: EXPIRED (needs refresh)");
+        } else {
+            println!("  Token status: valid");
+        }
+
+        if remaining > 0 {
+            println!("  Remaining: {} seconds (≈ {} minutes)", remaining, remaining / 60);
+        }
+
+        let expiry_time = chrono::DateTime::from_timestamp(t.expiry_timestamp, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| t.expiry_timestamp.to_string());
+        println!("  Expires at: {} (local time)", expiry_time);
     } else {
-        println!("\n✗ Not logged in. Run 'gemini-proxy login' to login.\n");
+        println!("\n  Not logged in. Run 'gemini-proxy login' to login.\n");
     }
 
     Ok(())
@@ -408,6 +484,46 @@ async fn cmd_logout() -> anyhow::Result<()> {
     let token_manager = token::TokenManager::new();
     token_manager.clear_token().await?;
     println!("\n✓ Logged out successfully.\n");
+    Ok(())
+}
+
+/// Stop the running daemon
+fn cmd_stop() -> anyhow::Result<()> {
+    let pid_path = config::get_pid_path();
+    let pid_str = match std::fs::read_to_string(&pid_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            println!("\nNo daemon running (PID file not found: {})\n", pid_path.display());
+            return Ok(());
+        }
+    };
+
+    let pid: i32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("\nInvalid PID file content: {}\n", pid_str);
+            return Ok(());
+        }
+    };
+
+    // Check if process exists
+    unsafe {
+        if libc::kill(pid, 0) != 0 {
+            println!("\nDaemon not running (PID {} not found)\n", pid);
+            std::fs::remove_file(&pid_path).ok();
+            return Ok(());
+        }
+    }
+
+    // Send SIGTERM
+    unsafe {
+        if libc::kill(pid, libc::SIGTERM) != 0 {
+            anyhow::bail!("Failed to send SIGTERM to PID {}: {}", pid, std::io::Error::last_os_error());
+        }
+    }
+
+    std::fs::remove_file(&pid_path).ok();
+    println!("\n✓ Daemon stopped (PID {})\n", pid);
     Ok(())
 }
 

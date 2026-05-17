@@ -16,10 +16,26 @@ OpenAI-compatible local proxy for Gemini.
 cargo build --release
 ```
 
-## Run
+## Quick start
 
 ```bash
+# Login
+./target/release/gemini-proxy login
+
+# Start server (foreground)
 ./target/release/gemini-proxy serve
+
+# Start server (background daemon)
+./target/release/gemini-proxy serve --daemon
+
+# Stop daemon
+./target/release/gemini-proxy stop
+
+# Check status
+./target/release/gemini-proxy status
+
+# Check quota
+./target/release/gemini-proxy quota
 ```
 
 Default bind:
@@ -66,6 +82,17 @@ Example:
 
 Environment variables can be used with `${NAME}` syntax.
 
+## Proxy
+
+Manage upstream proxy for OAuth and API calls:
+
+```bash
+./target/release/gemini-proxy proxy set socks5://127.0.0.1:1080
+./target/release/gemini-proxy proxy enable
+./target/release/gemini-proxy proxy disable
+./target/release/gemini-proxy proxy show
+```
+
 ## OAuth env vars
 
 Set these before login:
@@ -101,7 +128,7 @@ Non-streaming:
 curl http://127.0.0.1:8045/v1/chat/completions \
   -H "Authorization: Bearer $GEMINI_PROXY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 Streaming:
@@ -110,7 +137,7 @@ Streaming:
 curl http://127.0.0.1:8045/v1/chat/completions \
   -H "Authorization: Bearer $GEMINI_PROXY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 ## Logging

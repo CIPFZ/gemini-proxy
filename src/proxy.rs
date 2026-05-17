@@ -2,18 +2,18 @@
 //! This is a simplified implementation that avoids complex axum routing issues
 
 use crate::config::Config;
-use crate::openai::{chat_response_to_sse, chat_to_gemini, gemini_to_chat, ChatCompletionRequest};
+use crate::openai::{chat_to_gemini, gemini_to_chat, ChatCompletionRequest};
 use crate::quota::{fetch_project_id, fetch_quota};
 use crate::token::TokenManager;
 use crate::upstream::UpstreamClient;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use http_body_util::{BodyExt, Channel, channel::Sender};
+use hyper::body::{Bytes, Frame};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
@@ -66,22 +66,18 @@ pub async fn start_server(
     }
 }
 
-fn json_response(body: &str, status: StatusCode) -> Response<Full<Bytes>> {
+fn full_body(bytes: impl Into<Bytes>) -> Channel<Bytes> {
+    let (mut sender, channel) = Channel::<Bytes>::new(1);
+    let _ = sender.try_send(Frame::data(bytes.into()));
+    channel
+}
+
+fn json_response(body_str: &str, status: StatusCode) -> Response<Channel<Bytes>> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .header("content-length", body.len().to_string())
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap()
-}
-
-fn sse_response(body: String, status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .body(Full::new(Bytes::from(body)))
+        .header("content-length", body_str.len().to_string())
+        .body(full_body(Bytes::copy_from_slice(body_str.as_bytes())))
         .unwrap()
 }
 
@@ -91,13 +87,13 @@ async fn handle_request(
     token_manager: Arc<TokenManager>,
     upstream_client: Arc<UpstreamClient>,
     limiter: Arc<Semaphore>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Channel<Bytes>>, hyper::Error> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
     tracing::debug!("{} {}", method, path);
 
-    match (method, path.as_str()) {
+    match (method.clone(), path.as_str()) {
         (Method::GET, "/healthz") => {
             Ok(json_response(r#"{"status":"ok"}"#, StatusCode::OK))
         }
@@ -111,7 +107,10 @@ async fn handle_request(
             handle_chat_completions(req, config, token_manager, upstream_client, limiter).await
         }
         _ => {
-            handle_proxy_request(req, path, &config.upstream_proxy, token_manager, upstream_client).await
+            Ok(json_response(
+                &format!(r#"{{"error":"not found: {} {}"}}"#, method, path),
+                StatusCode::NOT_FOUND,
+            ))
         }
     }
 }
@@ -138,7 +137,7 @@ fn check_auth(req: &Request<Incoming>, api_key: &Option<String>) -> bool {
 async fn handle_quota_request(
     token_manager: Arc<TokenManager>,
     proxy: &crate::config::ProxyConfig,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Channel<Bytes>>, hyper::Error> {
     let access_token = match token_manager.get_fresh_token(&Some(proxy.clone())).await {
         Ok(token) => token,
         Err(e) => {
@@ -174,7 +173,7 @@ async fn handle_list_models(
     token_manager: Arc<TokenManager>,
     proxy: &crate::config::ProxyConfig,
     config: &Config,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Channel<Bytes>>, hyper::Error> {
     let access_token = match token_manager.get_fresh_token(&Some(proxy.clone())).await {
         Ok(token) => token,
         Err(e) => {
@@ -226,7 +225,7 @@ async fn handle_chat_completions(
     token_manager: Arc<TokenManager>,
     upstream_client: Arc<UpstreamClient>,
     limiter: Arc<Semaphore>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Channel<Bytes>>, hyper::Error> {
     if !check_auth(&req, &config.api_key) {
         return Ok(json_response(r#"{"error":{"message":"unauthorized"}}"#, StatusCode::UNAUTHORIZED));
     }
@@ -255,7 +254,7 @@ async fn handle_chat_completions(
     };
 
     let body_bytes = match req.into_body().collect().await {
-        Ok(bytes) => bytes.to_bytes().to_vec(),
+        Ok(bytes) => bytes.to_bytes(),
         Err(e) => {
             drop(permit);
             return Ok(json_response(&format!(r#"{{"error":"Failed to read body: {}"}}"#, e), StatusCode::BAD_REQUEST));
@@ -286,26 +285,33 @@ async fn handle_chat_completions(
 
     if openai_req.stream {
         let status = response.status();
-        let body = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                drop(permit);
-                return Ok(json_response(&format!(r#"{{"error":"Failed to read response: {}"}}"#, e), StatusCode::BAD_GATEWAY));
-            }
-        };
         if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
             drop(permit);
-            return Ok(json_response(&body, status));
+            return Ok(json_response(&error_body, status));
         }
-        let gemini_json: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
-        let chat = gemini_to_chat(&model_name, &gemini_json);
-        drop(permit);
-        return Ok(sse_response(chat_response_to_sse(&chat), StatusCode::OK));
+
+        let (mut sender, body) = Channel::new(32);
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = stream_upstream_to_client(response, &model_name, &mut sender).await {
+                tracing::error!("Streaming error: {}", e);
+            }
+        });
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(body)
+            .unwrap());
     }
 
     let status = response.status();
-    let body = match response.bytes().await {
-        Ok(bytes) => bytes.to_vec(),
+    let body_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
         Err(e) => {
             drop(permit);
             return Ok(json_response(&format!(r#"{{"error":"Failed to read response: {}"}}"#, e), StatusCode::BAD_GATEWAY));
@@ -313,109 +319,73 @@ async fn handle_chat_completions(
     };
     if !status.is_success() {
         drop(permit);
+        let len = body_bytes.len();
         return Ok(Response::builder()
             .status(status)
             .header("content-type", "application/json")
-            .header("content-length", body.len().to_string())
-            .body(Full::new(Bytes::from(body)))
+            .header("content-length", len.to_string())
+            .body(full_body(body_bytes))
             .unwrap());
     }
 
-    let gemini_json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let gemini_json: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| json!({}));
     let chat = gemini_to_chat(&model_name, &gemini_json);
-    let body = serde_json::to_string(&chat).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+    let response_str = serde_json::to_string(&chat).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
     drop(permit);
-    Ok(json_response(&body, StatusCode::OK))
+    Ok(json_response(&response_str, StatusCode::OK))
 }
 
-async fn handle_proxy_request(
-    req: Request<Incoming>,
-    path: String,
-    proxy: &crate::config::ProxyConfig,
-    token_manager: Arc<TokenManager>,
-    upstream_client: Arc<UpstreamClient>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Get token
-    let access_token = match token_manager.get_fresh_token(&Some(proxy.clone())).await {
-        Ok(token) => token,
-        Err(e) => {
-            return Ok(json_response(&format!(r#"{{"error":"{}"}}"#, e), StatusCode::INTERNAL_SERVER_ERROR));
-        }
-    };
+/// Stream upstream response to client, converting Gemini chunks to OpenAI format.
+/// The v1internal streamGenerateContent API returns a streaming JSON array:
+/// `[{...},\r\n{...},\r\n{...}\n]\n` where each element is a full Gemini response.
+async fn stream_upstream_to_client(
+    response: reqwest::Response,
+    model_name: &str,
+    sender: &mut Sender<Bytes>,
+) -> anyhow::Result<()> {
+    let mut converter = crate::openai::GeminiStreamConverter::new(model_name.to_string());
 
-    // Fetch project ID for v1internal API
-    let project_id = match fetch_project_id(&access_token, &Some(proxy.clone())).await {
-        Ok((pid, _)) => pid.unwrap_or_else(|| "cosmic-task-h4r8v".to_string()),
-        Err(_) => "cosmic-task-h4r8v".to_string(),
-    };
-
-    // Collect request body
-    let body_bytes = match req.into_body().collect().await {
-        Ok(bytes) => bytes.to_bytes().to_vec(),
-        Err(e) => {
-            return Ok(json_response(&format!(r#"{{"error":"Failed to read body: {}"}}"#, e), StatusCode::BAD_REQUEST));
-        }
-    };
-
-    let body: serde_json::Value = if body_bytes.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}))
-    };
-
-    // Parse the path: /v1beta/models/:model/:action or /v1beta/models/:model:action
-    let upstream_method = if path.contains(":") {
-        path.rsplit(':').next().unwrap_or("generateContent").to_string()
-    } else {
-        "generateContent".to_string()
-    };
-
-    // Extract model name from path (e.g., "gemini-3-flash" from "/v1beta/models/gemini-3-flash:generateContent")
-    let model_name = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .last()
-        .and_then(|s| s.split(':').next())
-        .unwrap_or("gemini-3-flash")
-        .to_string();
-
-    // Wrap request for v1internal API
-    let wrapped_body = wrap_request_for_v1internal(&body, &model_name, &project_id);
-
-    tracing::info!("Proxying request: model={}, method={}, project={}", model_name, upstream_method, project_id);
-
-    // Call upstream
-    let response = match upstream_client
-        .call_v1_internal(&upstream_method, &access_token, wrapped_body, None)
+    let full_body = response
+        .text()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            return Ok(json_response(&format!(r#"{{"error":"{}"}}"#, e), StatusCode::BAD_GATEWAY));
-        }
-    };
+        .map_err(|e| anyhow::anyhow!("Failed to read upstream stream: {}", e))?;
 
-    let status = response.status();
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(e) => {
-            return Ok(json_response(&format!(r#"{{"error":"Failed to read response: {}"}}"#, e), StatusCode::BAD_GATEWAY));
-        }
-    };
+    tracing::debug!("Upstream stream body ({} bytes)", full_body.len());
 
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .header("content-length", body_bytes.len().to_string())
-        .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap())
+    // Try to parse as JSON array: [{...},\r\n{...}\n]\n
+    if let Ok(array) = serde_json::from_str::<Vec<Value>>(&full_body) {
+        for chunk in array {
+            let sse_lines = converter.process_chunk(&chunk);
+            for sse in sse_lines {
+                if sender.send_data(Bytes::from(sse)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    } else if let Ok(single) = serde_json::from_str::<Value>(&full_body) {
+        // Try single object (not wrapped in array)
+        let sse_lines = converter.process_chunk(&single);
+        for sse in sse_lines {
+            if sender.send_data(Bytes::from(sse)).await.is_err() {
+                return Ok(());
+            }
+        }
+    } else {
+        tracing::warn!("Failed to parse upstream stream as JSON: {:?}", &full_body[..full_body.len().min(300)]);
+    }
+
+    if !converter.is_finished() {
+        let _ = sender.send_data(Bytes::from("data: [DONE]\n\n")).await;
+    }
+
+    Ok(())
 }
 
 /// Wrap request body for v1internal API format
 fn wrap_request_for_v1internal(body: &serde_json::Value, model_name: &str, project_id: &str) -> serde_json::Value {
     // Generate a simple session ID
     let session_id = format!("gemini-proxy-{}", chrono::Utc::now().timestamp_millis());
-    let request_id = format!("agent/antigravity/{}/1", &session_id[..session_id.len().min(8)]);
+    let request_id = format!("gemini-proxy-{}", &session_id[..session_id.len().min(8)]);
 
     // Clone the body to use as inner request
     let mut inner_request = body.clone();
@@ -435,12 +405,15 @@ fn wrap_request_for_v1internal(body: &serde_json::Value, model_name: &str, proje
     }
 
     // Build the v1internal request format
-    serde_json::json!({
+    // enabledCreditTypes uses Google AI Pro paid credits to bypass geo-restrictions
+    // userAgent/requestType intentionally omitted — they trigger per-client rate limits
+    let request = serde_json::json!({
         "project": project_id,
         "requestId": request_id,
         "request": inner_request,
         "model": model_name,
-        "userAgent": "antigravity",
-        "requestType": "agent"
-    })
+        "enabledCreditTypes": ["GOOGLE_ONE_AI"]
+    });
+
+    request
 }

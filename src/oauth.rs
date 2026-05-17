@@ -1,5 +1,5 @@
 //! Google OAuth module
-//! Simplified from Antigravity-Manager
+//! Matches Antigravity-Manager OAuth implementation
 
 use crate::config::ProxyConfig;
 use reqwest::{header, Client};
@@ -14,14 +14,13 @@ const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
 
-/// Native OAuth User-Agent - matching AntigravityManager
+/// Native OAuth User-Agent — matching AntigravityManager
 const NATIVE_OAUTH_USER_AGENT: &str = "vscode/1.X.X (Antigravity/4.1.31)";
 
-/// Build HTTP client with optional proxy support
+/// Build HTTP client with optional proxy support (60s timeout, matching Antigravity)
 fn build_client(proxy: &Option<ProxyConfig>) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
-        .user_agent(NATIVE_OAUTH_USER_AGENT)
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(60));
 
     if let Some(p) = proxy {
         if p.enabled && !p.url.is_empty() {
@@ -36,25 +35,23 @@ fn build_client(proxy: &Option<ProxyConfig>) -> anyhow::Result<Client> {
 }
 
 fn client_id() -> anyhow::Result<String> {
-    std::env::var(CLIENT_ID_ENV)
-        .or_else(|_| {
-            std::env::var("GEMINI_PROXY_CLIENT_ID")
-        })
-        .map_err(|_| anyhow::anyhow!(
-            "Missing Google OAuth client ID. Set {} or GEMINI_PROXY_CLIENT_ID.",
-            CLIENT_ID_ENV
-        ))
+    let id = std::env::var(CLIENT_ID_ENV)
+        .or_else(|_| std::env::var("GEMINI_PROXY_CLIENT_ID"))
+        .unwrap_or_default();
+    if id.is_empty() {
+        anyhow::bail!("No OAuth client ID configured. Set GEMINI_PROXY_GOOGLE_CLIENT_ID or GEMINI_PROXY_CLIENT_ID");
+    }
+    Ok(id)
 }
 
 fn client_secret() -> anyhow::Result<String> {
-    std::env::var(CLIENT_SECRET_ENV)
-        .or_else(|_| {
-            std::env::var("GEMINI_PROXY_CLIENT_SECRET")
-        })
-        .map_err(|_| anyhow::anyhow!(
-            "Missing Google OAuth client secret. Set {} or GEMINI_PROXY_CLIENT_SECRET.",
-            CLIENT_SECRET_ENV
-        ))
+    let secret = std::env::var(CLIENT_SECRET_ENV)
+        .or_else(|_| std::env::var("GEMINI_PROXY_CLIENT_SECRET"))
+        .unwrap_or_default();
+    if secret.is_empty() {
+        anyhow::bail!("No OAuth client secret configured. Set GEMINI_PROXY_GOOGLE_CLIENT_SECRET or GEMINI_PROXY_CLIENT_SECRET");
+    }
+    Ok(secret)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,6 +122,7 @@ impl std::fmt::Display for TokenData {
 pub fn get_auth_url(redirect_uri: &str, state: &str) -> anyhow::Result<String> {
     let client_id = client_id()?;
     let scopes = vec![
+        "openid",
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile",
@@ -167,12 +165,24 @@ pub async fn exchange_code(code: &str, redirect_uri: &str, proxy: &Option<ProxyC
 
     let response = client
         .post(TOKEN_URL)
+        .header(header::USER_AGENT, NATIVE_OAUTH_USER_AGENT)
         .form(&params)
         .send()
         .await
         .map_err(|e| {
-            tracing::error!("Token exchange request failed: {}", e);
-            anyhow::anyhow!("Token exchange request failed: {}", e)
+            if e.is_connect() || e.is_timeout() {
+                tracing::error!(
+                    "Token exchange connection/timeout: {}. Check proxy/network settings.",
+                    e
+                );
+                anyhow::anyhow!(
+                    "Token exchange request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
+                    e
+                )
+            } else {
+                tracing::error!("Token exchange request failed: {}", e);
+                anyhow::anyhow!("Token exchange request failed: {}", e)
+            }
         })?;
 
     if response.status().is_success() {
@@ -219,10 +229,20 @@ pub async fn refresh_access_token(refresh_token: &str, proxy: &Option<ProxyConfi
 
     let response = client
         .post(TOKEN_URL)
+        .header(header::USER_AGENT, NATIVE_OAUTH_USER_AGENT)
         .form(&params)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Refresh request failed: {}", e))?;
+        .map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                anyhow::anyhow!(
+                    "Refresh request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
+                    e
+                )
+            } else {
+                anyhow::anyhow!("Refresh request failed: {}", e)
+            }
+        })?;
 
     if response.status().is_success() {
         let token_res = response

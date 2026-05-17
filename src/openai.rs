@@ -89,6 +89,111 @@ pub struct ChatUsage {
     pub total_tokens: i32,
 }
 
+/// Stateful converter: Gemini SSE stream chunks -> OpenAI SSE delta chunks.
+///
+/// Gemini sends accumulated text; we compute deltas and emit OpenAI-compatible
+/// SSE lines. Call [`process_chunk`] for each upstream SSE JSON event, then
+/// send each resulting string to the client.
+pub struct GeminiStreamConverter {
+    id: String,
+    model: String,
+    created: i64,
+    sent_text_len: usize,
+    finished: bool,
+}
+
+impl GeminiStreamConverter {
+    pub fn new(model: String) -> Self {
+        Self {
+            id: format!("chatcmpl_{}", chrono::Utc::now().timestamp_millis()),
+            model,
+            created: chrono::Utc::now().timestamp(),
+            sent_text_len: 0,
+            finished: false,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Process one Gemini SSE JSON chunk.
+    /// Returns SSE event strings to send to the client (e.g. `data: {...}\n\n`).
+    /// Returns an empty vec if the chunk contains no new content.
+    pub fn process_chunk(&mut self, gemini: &Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+
+        // v1internal API wraps each chunk in a "response" field
+        let gemini = gemini.get("response").unwrap_or(gemini);
+
+        let candidate = gemini
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first());
+
+        let parts = candidate
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut full_text = String::new();
+        for part in &parts {
+            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                full_text.push_str(t);
+            }
+        }
+
+        let finish_reason_raw = candidate
+            .and_then(|c| c.get("finishReason"))
+            .and_then(|v| v.as_str())
+            .map(|r| normalize_finish_reason(r));
+
+        let mut out = Vec::new();
+
+        // Emit text delta if there's new text
+        if full_text.len() > self.sent_text_len {
+            let delta = full_text[self.sent_text_len..].to_string();
+            self.sent_text_len = full_text.len();
+            out.push(self.build_sse(&json!({
+                "content": delta,
+            }), None));
+        }
+
+        // Emit finish chunk + [DONE] when finishReason appears
+        if let Some(reason) = finish_reason_raw {
+            out.push(self.build_sse(&json!({}), Some(&reason)));
+            out.push("data: [DONE]\n\n".to_string());
+            self.finished = true;
+        }
+
+        out
+    }
+
+    fn build_sse(&self, delta: &Value, finish_reason: Option<&str>) -> String {
+        let delta_map = delta.clone();
+        if delta_map.as_object().map_or(true, |o| o.is_empty()) && finish_reason.is_none() {
+            return String::new();
+        }
+
+        let chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta_map,
+                "finish_reason": finish_reason,
+            }]
+        });
+        format!("data: {}\n\n", chunk)
+    }
+}
+
 pub fn chat_to_gemini(req: &ChatCompletionRequest) -> Value {
     let mut contents = Vec::new();
     let mut system_text = String::new();
@@ -180,6 +285,9 @@ pub fn chat_to_gemini(req: &ChatCompletionRequest) -> Value {
 }
 
 pub fn gemini_to_chat(model: &str, gemini: &Value) -> ChatCompletionResponse {
+    // v1internal API wraps response in a "response" field
+    let gemini = gemini.get("response").unwrap_or(gemini);
+
     let candidate = gemini
         .get("candidates")
         .and_then(|v| v.as_array())
@@ -244,56 +352,6 @@ pub fn gemini_to_chat(model: &str, gemini: &Value) -> ChatCompletionResponse {
         }],
         usage,
     }
-}
-
-pub fn chat_response_to_sse(resp: &ChatCompletionResponse) -> String {
-    let mut out = String::new();
-    if let Some(choice) = resp.choices.first() {
-        if let Some(content) = &choice.message.content {
-            let chunk = json!({
-                "id": resp.id,
-                "object": "chat.completion.chunk",
-                "created": resp.created,
-                "model": resp.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": content },
-                    "finish_reason": null
-                }]
-            });
-            out.push_str("data: ");
-            out.push_str(&chunk.to_string());
-            out.push_str("\n\n");
-        }
-        for (idx, call) in choice.message.tool_calls.iter().enumerate() {
-            let chunk = json!({
-                "id": resp.id,
-                "object": "chat.completion.chunk",
-                "created": resp.created,
-                "model": resp.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": idx,
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments
-                            }
-                        }]
-                    },
-                    "finish_reason": null
-                }]
-            });
-            out.push_str("data: ");
-            out.push_str(&chunk.to_string());
-            out.push_str("\n\n");
-        }
-    }
-    out.push_str("data: [DONE]\n\n");
-    out
 }
 
 fn normalize_finish_reason(reason: &str) -> String {
@@ -416,5 +474,40 @@ mod tests {
         let out = gemini_to_chat("gemini-3-flash", &gemini);
         assert_eq!(out.choices[0].message.tool_calls[0].function.name, "Read");
         assert!(out.choices[0].message.tool_calls[0].function.arguments.contains("a.txt"));
+    }
+
+    #[test]
+    fn streams_gemini_chunks_to_openai_delta_sse() {
+        let mut c = GeminiStreamConverter::new("gemini-3-flash".to_string());
+
+        // First chunk: partial text
+        let lines = c.process_chunk(&json!({
+            "candidates": [{"content": {"parts": [{"text": "Hello"}], "role": "model"}}]
+        }));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains(r#""delta":{"content":"Hello"}"#));
+        assert!(!c.is_finished());
+
+        // Second chunk: accumulated text
+        let lines = c.process_chunk(&json!({
+            "candidates": [{"content": {"parts": [{"text": "Hello world"}], "role": "model"}}]
+        }));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains(r#""content":" world""#)); // only delta
+
+        // Third chunk: finish signal
+        let lines = c.process_chunk(&json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Hello world"}], "role": "model"},
+                "finishReason": "STOP"
+            }]
+        }));
+        assert_eq!(lines.len(), 2); // finish chunk + [DONE]
+        assert!(lines[0].contains(r#""finish_reason":"stop""#));
+        assert_eq!(lines[1], "data: [DONE]\n\n");
+        assert!(c.is_finished());
+
+        // Extra chunks after finish are ignored
+        assert!(c.process_chunk(&json!({"candidates":[]})).is_empty());
     }
 }

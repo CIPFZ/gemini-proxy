@@ -1,24 +1,26 @@
 //! Upstream client for Google Gemini API
-//! With JA3 fingerprint emulation and endpoint fallback
+//! With endpoint fallback and Antigravity-compatible identity headers
 
 use crate::config::ProxyConfig;
 use reqwest::{header, Client, Response, StatusCode};
 use serde_json::Value;
 use std::time::Duration;
 
-// User-Agent for upstream requests - matching AntigravityManager
-const UPSTREAM_USER_AGENT: &str = "vscode/1.X.X (Antigravity/4.1.31)";
+// User-Agent for upstream requests — generic Chrome UA to avoid triggering
+// geo-restrictions or per-client rate limits
+const UPSTREAM_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
-// Cloud Code v1internal endpoints (fallback order: Sandbox → Daily → Prod)
+// Cloud Code v1internal endpoints (fallback order: Daily → Prod → Sandbox)
 const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
 const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
-    V1_INTERNAL_BASE_URL_SANDBOX, // Priority 1: Sandbox (known stable)
-    V1_INTERNAL_BASE_URL_DAILY,    // Priority 2: Daily (backup)
-    V1_INTERNAL_BASE_URL_PROD,    // Priority 3: Prod (fallback only)
+    V1_INTERNAL_BASE_URL_DAILY,   // Priority 1: Daily (works for Gemini)
+    V1_INTERNAL_BASE_URL_PROD,    // Priority 2: Prod (backup)
+    V1_INTERNAL_BASE_URL_SANDBOX,  // Priority 3: Sandbox (last resort)
 ];
 
 /// Upstream client wrapper
@@ -104,11 +106,8 @@ impl UpstreamClient {
             header::HeaderValue::from_static(UPSTREAM_USER_AGENT),
         );
 
-        // Antigravity identity headers
-        headers.insert(
-            "x-client-name",
-            header::HeaderValue::from_static("gemini-proxy"),
-        );
+        // NOTE: x-client-name and x-client-version intentionally omitted —
+        // they trigger per-client rate limits and geo-restrictions on Gemini API
 
         let mut last_err: Option<String> = None;
 
@@ -154,7 +153,7 @@ impl UpstreamClient {
                 }
                 Err(e) => {
                     let msg = format!("HTTP request failed at {}: {}", base_url, e);
-                    tracing::debug!("{}", msg);
+                    tracing::warn!("{}", msg);
                     last_err = Some(msg);
 
                     if !has_next {
@@ -193,11 +192,8 @@ impl UpstreamClient {
             header::HeaderValue::from_static(UPSTREAM_USER_AGENT),
         );
 
-        // Antigravity identity headers
-        headers.insert(
-            "x-client-name",
-            header::HeaderValue::from_static("gemini-proxy"),
-        );
+        // NOTE: x-client-name and x-client-version intentionally omitted —
+        // they trigger per-client rate limits and geo-restrictions on Gemini API
 
         // Add extra headers
         for (k, v) in extra_headers {
@@ -247,7 +243,7 @@ impl UpstreamClient {
                 }
                 Err(e) => {
                     let msg = format!("HTTP request failed at {}: {}", base_url, e);
-                    tracing::debug!("{}", msg);
+                    tracing::warn!("{}", msg);
                     last_err = Some(msg);
 
                     if !has_next {
