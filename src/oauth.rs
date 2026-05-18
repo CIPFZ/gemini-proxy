@@ -34,24 +34,44 @@ fn build_client(proxy: &Option<ProxyConfig>) -> anyhow::Result<Client> {
     builder.build().map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))
 }
 
-fn client_id() -> anyhow::Result<String> {
-    let id = std::env::var(CLIENT_ID_ENV)
+fn client_id(oauth_config: Option<&crate::config::OAuthConfig>) -> anyhow::Result<String> {
+    let from_env = std::env::var(CLIENT_ID_ENV)
         .or_else(|_| std::env::var("GEMINI_PROXY_CLIENT_ID"))
-        .unwrap_or_default();
-    if id.is_empty() {
-        anyhow::bail!("No OAuth client ID configured. Set GEMINI_PROXY_GOOGLE_CLIENT_ID or GEMINI_PROXY_CLIENT_ID");
+        .ok();
+    if let Some(ref id) = from_env {
+        if !id.is_empty() {
+            return Ok(id.clone());
+        }
     }
-    Ok(id)
+    // Fallback to config file
+    if let Some(cfg) = oauth_config {
+        if let Some(ref id) = cfg.client_id {
+            if !id.is_empty() {
+                return Ok(id.clone());
+            }
+        }
+    }
+    anyhow::bail!("No OAuth client ID configured. Set GEMINI_PROXY_GOOGLE_CLIENT_ID env var or add oauth.client_id to config.json");
 }
 
-fn client_secret() -> anyhow::Result<String> {
-    let secret = std::env::var(CLIENT_SECRET_ENV)
+fn client_secret(oauth_config: Option<&crate::config::OAuthConfig>) -> anyhow::Result<String> {
+    let from_env = std::env::var(CLIENT_SECRET_ENV)
         .or_else(|_| std::env::var("GEMINI_PROXY_CLIENT_SECRET"))
-        .unwrap_or_default();
-    if secret.is_empty() {
-        anyhow::bail!("No OAuth client secret configured. Set GEMINI_PROXY_GOOGLE_CLIENT_SECRET or GEMINI_PROXY_CLIENT_SECRET");
+        .ok();
+    if let Some(ref s) = from_env {
+        if !s.is_empty() {
+            return Ok(s.clone());
+        }
     }
-    Ok(secret)
+    // Fallback to config file
+    if let Some(cfg) = oauth_config {
+        if let Some(ref s) = cfg.client_secret {
+            if !s.is_empty() {
+                return Ok(s.clone());
+            }
+        }
+    }
+    anyhow::bail!("No OAuth client secret configured. Set GEMINI_PROXY_GOOGLE_CLIENT_SECRET env var or add oauth.client_secret to config.json");
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,8 +139,8 @@ impl std::fmt::Display for TokenData {
 }
 
 /// Generate OAuth authorization URL
-pub fn get_auth_url(redirect_uri: &str, state: &str) -> anyhow::Result<String> {
-    let client_id = client_id()?;
+pub fn get_auth_url(redirect_uri: &str, state: &str, oauth_config: &crate::config::OAuthConfig) -> anyhow::Result<String> {
+    let client_id = client_id(Some(oauth_config))?;
     let scopes = vec![
         "openid",
         "https://www.googleapis.com/auth/cloud-platform",
@@ -148,10 +168,10 @@ pub fn get_auth_url(redirect_uri: &str, state: &str) -> anyhow::Result<String> {
 }
 
 /// Exchange authorization code for token
-pub async fn exchange_code(code: &str, redirect_uri: &str, proxy: &Option<ProxyConfig>) -> anyhow::Result<TokenResponse> {
+pub async fn exchange_code(code: &str, redirect_uri: &str, proxy: &Option<ProxyConfig>, oauth_config: &crate::config::OAuthConfig) -> anyhow::Result<TokenResponse> {
     let client = build_client(proxy)?;
-    let client_id = client_id()?;
-    let client_secret = client_secret()?;
+    let client_id = client_id(Some(oauth_config))?;
+    let client_secret = client_secret(Some(oauth_config))?;
 
     let params = [
         ("client_id", client_id.as_str()),
@@ -213,10 +233,10 @@ pub async fn exchange_code(code: &str, redirect_uri: &str, proxy: &Option<ProxyC
 }
 
 /// Refresh access token
-pub async fn refresh_access_token(refresh_token: &str, proxy: &Option<ProxyConfig>) -> anyhow::Result<TokenResponse> {
+pub async fn refresh_access_token(refresh_token: &str, proxy: &Option<ProxyConfig>, oauth_config: &crate::config::OAuthConfig) -> anyhow::Result<TokenResponse> {
     let client = build_client(proxy)?;
-    let client_id = client_id()?;
-    let client_secret = client_secret()?;
+    let client_id = client_id(Some(oauth_config))?;
+    let client_secret = client_secret(Some(oauth_config))?;
 
     let params = [
         ("client_id", client_id.as_str()),
@@ -284,7 +304,7 @@ pub async fn get_user_info(access_token: &str, proxy: &Option<ProxyConfig>) -> a
 }
 
 /// Ensure we have a fresh token, refresh if needed
-pub async fn ensure_fresh_token(current: &TokenData, proxy: &Option<ProxyConfig>) -> anyhow::Result<TokenData> {
+pub async fn ensure_fresh_token(current: &TokenData, proxy: &Option<ProxyConfig>, oauth_config: &crate::config::OAuthConfig) -> anyhow::Result<TokenData> {
     let now = chrono::Local::now().timestamp();
 
     // Keep enough validity to avoid immediate post-switch refresh failure.
@@ -294,7 +314,7 @@ pub async fn ensure_fresh_token(current: &TokenData, proxy: &Option<ProxyConfig>
 
     tracing::info!("Token expiring soon, refreshing...");
 
-    let response = refresh_access_token(&current.refresh_token, proxy).await?;
+    let response = refresh_access_token(&current.refresh_token, proxy, oauth_config).await?;
 
     // Construct new TokenData
     Ok(TokenData::new(

@@ -24,6 +24,10 @@ impl Default for ProxyConfig {
 /// OAuth client configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
+    /// OAuth client ID (Google Cloud Console)
+    pub client_id: Option<String>,
+    /// OAuth client secret (Google Cloud Console)
+    pub client_secret: Option<String>,
     /// Client key (default: "antigravity_enterprise")
     pub client_key: String,
     /// OAuth redirect URI
@@ -33,6 +37,8 @@ pub struct OAuthConfig {
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
+            client_id: None,
+            client_secret: None,
             client_key: "antigravity_enterprise".to_string(),
             redirect_uri: "http://localhost:8045/callback".to_string(),
         }
@@ -161,6 +167,8 @@ mod tests {
                 url: "${CCP_TEST_PROXY}".to_string(),
             },
             oauth: OAuthConfig {
+                client_id: None,
+                client_secret: None,
                 client_key: "${CCP_TEST_API_KEY}".to_string(),
                 redirect_uri: "http://${CCP_TEST_BIND}/callback".to_string(),
             },

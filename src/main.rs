@@ -232,13 +232,13 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             cmd_login(&config, force, cli.config.as_ref()).await?;
         }
         Some(Commands::Status) => {
-            cmd_status().await?;
+            cmd_status(&config).await?;
         }
         Some(Commands::Quota) => {
             cmd_quota(&config).await?;
         }
         Some(Commands::Logout) => {
-            cmd_logout().await?;
+            cmd_logout(&config).await?;
         }
         Some(Commands::Stop) => {
             cmd_stop()?;
@@ -260,7 +260,7 @@ async fn cmd_serve(config: &config::Config, bind: &str) -> anyhow::Result<()> {
     tracing::info!("Starting Gemini Proxy on {}", bind);
 
     // Initialize token manager
-    let token_manager = token::TokenManager::new();
+    let token_manager = token::TokenManager::new(config.oauth.clone());
 
     // Check if logged in
     if !token_manager.is_logged_in().await {
@@ -327,7 +327,7 @@ async fn cmd_login(config: &config::Config, _force: bool, _cli_config_path: Opti
     let state = format!("gemini_proxy_{}", chrono::Local::now().timestamp_millis());
 
     // Generate auth URL
-    let auth_url = get_auth_url(&config.oauth.redirect_uri, &state)?;
+    let auth_url = get_auth_url(&config.oauth.redirect_uri, &state, &config.oauth)?;
     tracing::info!("Generated OAuth URL, opening browser...");
 
     println!("\n=== Gemini Proxy Login ===\n");
@@ -364,7 +364,7 @@ async fn cmd_login(config: &config::Config, _force: bool, _cli_config_path: Opti
 
     // Exchange code for token
     tracing::info!("Exchanging authorization code...");
-    let token_response = exchange_code(&code, &config.oauth.redirect_uri, &proxy).await?;
+    let token_response = exchange_code(&code, &config.oauth.redirect_uri, &proxy, &config.oauth).await?;
 
     // Get refresh token
     let refresh_token = token_response
@@ -394,8 +394,8 @@ async fn cmd_login(config: &config::Config, _force: bool, _cli_config_path: Opti
 }
 
 /// Check login status
-async fn cmd_status() -> anyhow::Result<()> {
-    let token_manager = token::TokenManager::new();
+async fn cmd_status(config: &config::Config) -> anyhow::Result<()> {
+    let token_manager = token::TokenManager::new(config.oauth.clone());
 
     let token = token_manager.get_token().await;
     if let Some(t) = token {
@@ -428,7 +428,7 @@ async fn cmd_status() -> anyhow::Result<()> {
 
 /// Show quota information
 async fn cmd_quota(config: &config::Config) -> anyhow::Result<()> {
-    let token_manager = token::TokenManager::new();
+    let token_manager = token::TokenManager::new(config.oauth.clone());
 
     if !token_manager.is_logged_in().await {
         anyhow::bail!("Not logged in. Please run 'gemini-proxy login' first.");
@@ -480,8 +480,8 @@ async fn cmd_quota(config: &config::Config) -> anyhow::Result<()> {
 }
 
 /// Logout (clear stored token)
-async fn cmd_logout() -> anyhow::Result<()> {
-    let token_manager = token::TokenManager::new();
+async fn cmd_logout(config: &config::Config) -> anyhow::Result<()> {
+    let token_manager = token::TokenManager::new(config.oauth.clone());
     token_manager.clear_token().await?;
     println!("\n✓ Logged out successfully.\n");
     Ok(())

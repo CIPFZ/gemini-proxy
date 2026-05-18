@@ -61,7 +61,10 @@ pub struct ModelInfo {
     pub supports_images: Option<bool>,
     pub supports_thinking: Option<bool>,
     pub thinking_budget: Option<i32>,
+    pub recommended: Option<bool>,
     pub max_tokens: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub supported_mime_types: Option<std::collections::HashMap<String, bool>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,8 +84,14 @@ struct ModelInfoResponse {
     supports_thinking: Option<bool>,
     #[serde(rename = "thinkingBudget")]
     thinking_budget: Option<i32>,
+    #[serde(rename = "recommended")]
+    recommended: Option<bool>,
     #[serde(rename = "maxTokens")]
     max_tokens: Option<i32>,
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: Option<i32>,
+    #[serde(rename = "supportedMimeTypes")]
+    supported_mime_types: Option<std::collections::HashMap<String, bool>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,7 +241,10 @@ pub async fn fetch_quota(
                                 supports_images: info.supports_images,
                                 supports_thinking: info.supports_thinking,
                                 thinking_budget: info.thinking_budget,
+                                recommended: info.recommended,
                                 max_tokens: info.max_tokens,
+                                max_output_tokens: info.max_output_tokens,
+                                supported_mime_types: info.supported_mime_types,
                             });
                         }
                     }

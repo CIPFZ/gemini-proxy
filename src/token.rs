@@ -1,17 +1,18 @@
 //! Simple Token Manager
 //! Single-account token storage with auto-refresh
 
-use crate::config::ProxyConfig;
+use crate::config::{OAuthConfig, ProxyConfig};
 use crate::oauth::{ensure_fresh_token, load_token, save_token, TokenData};
 use std::sync::Arc;
 
 /// Simple token manager for single account
 pub struct TokenManager {
     token: Arc<tokio::sync::RwLock<Option<TokenData>>>,
+    oauth_config: OAuthConfig,
 }
 
 impl TokenManager {
-    pub fn new() -> Self {
+    pub fn new(oauth_config: OAuthConfig) -> Self {
         let token = load_token().ok().flatten();
         if token.is_some() {
             tracing::info!("Token loaded from storage");
@@ -20,6 +21,7 @@ impl TokenManager {
         }
         Self {
             token: Arc::new(tokio::sync::RwLock::new(token)),
+            oauth_config,
         }
     }
 
@@ -48,7 +50,7 @@ impl TokenManager {
 
         // Check and refresh if needed
         tracing::debug!("Getting fresh token, expiry: {}", token.expiry_timestamp);
-        let fresh = ensure_fresh_token(&token, proxy).await?;
+        let fresh = ensure_fresh_token(&token, proxy, &self.oauth_config).await?;
 
         // Save if refreshed
         if fresh.access_token != token.access_token {
@@ -76,11 +78,5 @@ impl TokenManager {
         let mut guard = self.token.write().await;
         *guard = None;
         Ok(())
-    }
-}
-
-impl Default for TokenManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
